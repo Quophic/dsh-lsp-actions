@@ -29,6 +29,19 @@ import {
 } from './render.ts'
 import type { LspRange } from './vocabulary.ts'
 
+/** SymbolKind label → integer code (LSP spec), index 1..26. */
+const SYMBOL_KIND_CODES: Record<string, number> = {
+  File: 1, Module: 2, Namespace: 3, Package: 4, Class: 5, Method: 6, Property: 7,
+  Field: 8, Constructor: 9, Enum: 10, Interface: 11, Function: 12, Variable: 13,
+  Constant: 14, String: 15, Number: 16, Boolean: 17, Array: 18, Object: 19, Key: 20,
+  Null: 21, EnumMember: 22, Struct: 23, Event: 24, Operator: 25, TypeParameter: 26,
+}
+
+/** Map a kind label (e.g. "Function") to its SymbolKind integer; unknown labels → NaN (no match). */
+function symbolKindCode(label: string): number {
+  return SYMBOL_KIND_CODES[label] ?? NaN
+}
+
 /** The one-based range schema, shared by the range-accepting extended tools. */
 const RANGE_SCHEMA = {
   type: 'object',
@@ -188,10 +201,15 @@ export function registerSymbolsTool(ctx: Context, runner: ActionRunner, config: 
   ctx.tools.register(defineTool({
     name: 'lsp_symbols',
     description:
-      'Search symbols: with query, a workspace-wide name search through the language server; with file_path but no query, the symbol outline of one file. Read-only.',
+      'Search symbols: with query, a workspace-wide name search through the language server; with file_path but no query, the symbol outline of one file. Optional kind filters (an ANY-of whitelist: pass one or more SymbolKind labels to keep only symbols of those kinds, e.g. ["Function","Method","Class"]). Omit to return all kinds. Use filters to drop noise like inline-style Property/Variable symbols. Full LSP SymbolKind set: File, Module, Namespace, Package, Class, Method, Property, Field, Constructor, Enum, Interface, Function, Variable, Constant, String, Number, Boolean, Array, Object, Key, Null, EnumMember, Struct, Event, Operator, TypeParameter. Read-only.',
     parameters: {
       query: { type: 'string', description: 'The symbol name to search across the workspace (substring match).' },
       file_path: { type: 'string', description: 'Restrict the search to one file\'s symbols when query is omitted; with query, the file only routes the server selection.' },
+      kind: {
+        type: 'array',
+        description: 'Optional SymbolKind filter as an ANY-of whitelist. Pass one or more labels to keep only symbols of those kinds (OR match), e.g. ["Function","Method","Class"]. Omit (or pass []) to return all kinds. All 26 LSP kinds supported by label or by integer code, e.g. File(1), Module(2), Namespace(3), Package(4), Class(5), Method(6), Property(7), Field(8), Constructor(9), Enum(10), Interface(11), Function(12), Variable(13), Constant(14), String(15), Number(16), Boolean(17), Array(18), Object(19), Key(20), Null(21), EnumMember(22), Struct(23), Event(24), Operator(25), TypeParameter(26). Use this to ignore inline CSS/property noise and see only structural symbols.',
+        items: { type: 'string' },
+      },
     },
     output: {
       schema: {
@@ -239,14 +257,19 @@ export function registerSymbolsTool(ctx: Context, runner: ActionRunner, config: 
       }),
     },
     timeoutMs: config.timeoutMs,
-    async execute(args: { query?: string; file_path?: string }, exec) {
+    async execute(args: { query?: string; file_path?: string; kind?: string[] }, exec) {
       if ((args.query ?? '').trim() === '' && (args.file_path ?? '').trim() === '') {
         throw new Error('lsp_symbols requires a non-empty query or file_path')
       }
       const workspaceRoot = requireWorkspace(exec)
-      const project = <T,>(result: { items: readonly T[] }): { items: T[]; truncated: boolean; total: number } => {
-        const capped = result.items.slice(0, config.maxSymbols)
-        return { items: [...capped], truncated: result.items.length > capped.length, total: result.items.length }
+      // Accept both exact labels ("Function") and SymbolKind integers ("12") to be forgiving.
+      const wantedKinds = (args.kind ?? []).map(raw => Number.isInteger(Number(raw)) ? Number(raw) : symbolKindCode(raw))
+      const kindFilter = <T extends { kind: number }>(items: readonly T[]): readonly T[] =>
+        wantedKinds.length === 0 ? items : items.filter(item => wantedKinds.includes(item.kind))
+      const project = <T extends { kind: number },>(result: { items: readonly T[] }): { items: T[]; truncated: boolean; total: number } => {
+        const filtered = kindFilter(result.items)
+        const capped = filtered.slice(0, config.maxSymbols)
+        return { items: [...capped], truncated: filtered.length > capped.length, total: filtered.length }
       }
       if (args.query !== undefined && args.query.trim() !== '') {
         // Workspace-wide search. The optional file_path routes the server selection and, when
